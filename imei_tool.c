@@ -78,23 +78,39 @@ void menu(sqlite3 *db) {
         printf("3. 驗證 IMEI\n");
         printf("4. 離開\n");
         printf("請選擇: ");
-        scanf("%d", &choice);
+        int rc = scanf("%d", &choice);
+        if (rc != 1) {
+            // 清空残留在输入, 无效选项回显
+            int c;
+            while ((c = getchar()) != '\n' && c != EOF) {}
+            printf("無效選項。\n");
+            continue;
+        }
 
         switch (choice) {
-            case 1:
+            case 1: {
                 printf("輸入 IMEI 前綴 (8 碼): ");
-                scanf("%s", input);
+                if (scanf("%63s", input) != 1) { while(getchar()!='\n'&&getchar()!=EOF); break; }
                 printf("輸入設備型號: ");
-                scanf(" %[^\n]", model);
-                if (strlen(input) == 8) {
-                    if (import_prefix(db, input, model) == 0)
+                if (scanf(" %63[^\n]", model) != 1) { while(getchar()!='\n'&&getchar()!=EOF); break; }
+                // 去型号首尾空白
+                char *m2 = model;
+                while (*m2==' '||*m2=='\t') m2++;
+                char *me = m2 + strlen(m2);
+                while (me>m2 && (me[-1]==' '||me[-1]=='\t')) *--me=0;
+                // 前缀必须 8 位纯数字
+                int ok = (strlen(input)==8);
+                if (ok) for (char *p=input; *p; ++p) if(!(*p>='0'&&*p<='9')){ok=0;break;}
+                if (ok) {
+                    if (import_prefix(db, input, m2) == 0)
                         printf("匯入成功。\n");
                     else
                         printf("匯入失敗或已存在。\n");
                 } else {
-                    printf("前綴需為 8 碼。\n");
+                    printf("前綴需為 8 位數字。\n");
                 }
                 break;
+            }
             case 2: {
                 printf("輸入設備型號 (可留空): ");
                 // scanf("%d") 后残留换行; 用循环清空 stdin, 避免 getchar 吃有效输入
@@ -113,7 +129,7 @@ void menu(sqlite3 *db) {
             }
             case 3:
                 printf("輸入 IMEI (15 碼): ");
-                scanf("%s", input);
+                if (scanf("%63s", input) != 1) { while(getchar()!='\n'&&getchar()!=EOF); break; }
                 if (strlen(input) == 15) {
                     if (validate_imei(input))
                         printf("IMEI 驗證通過。\n");
