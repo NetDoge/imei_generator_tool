@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 #include "sqlite3.h"
 
 #define IMEI_DB "imei.db"
@@ -30,7 +31,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    srand((unsigned int) time(NULL));
+    unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)getpid();
+    srand(seed);
 
     if (argc == 1) {
         menu(db);
@@ -95,7 +97,9 @@ void menu(sqlite3 *db) {
                 break;
             case 2: {
                 printf("輸入設備型號 (可留空): ");
-                getchar(); // 清除換行符
+                // scanf("%d") 后残留换行; 用循环清空 stdin, 避免 getchar 吃有效输入
+                int ch;
+                while ((ch = getchar()) != '\n' && ch != EOF) {}
                 fgets(model, sizeof(model), stdin);
                 model[strcspn(model, "\n")] = 0;  // 去除換行
                 char *imei = generate_imei(db, strlen(model) > 0 ? model : NULL);
@@ -158,20 +162,38 @@ int import_prefix_csv(sqlite3 *db, const char *filepath) {
     }
 
     char line[MAX_LINE];
-    int success = 0, total = 0;
+    int success = 0, total = 0, skipped = 0;
     while (fgets(line, sizeof(line), fp)) {
-        char *prefix = strtok(line, ",;\n\r");
-        char *model = strtok(NULL, "\n\r");
-        if (prefix && model && strlen(prefix) == 8) {
-            if (import_prefix(db, prefix, model) == 0) {
-                success++;
-            }
-            total++;
+        line[strcspn(line, "\r\n")] = 0;   // 去掉行尾 CR/LF
+        total++;
+        // 找第一个有效分隔符; 型号只允许含简单字符(防注入逗号截断)
+        char *delim = strpbrk(line, ",;");
+        if (!delim) { skipped++; continue; }
+        *delim = 0;
+        char *prefix = line;
+        char *model = delim + 1;
+        // 去首尾空白
+        while (*prefix == ' ' || *prefix == '\t') prefix++;
+        char *pe = prefix + strlen(prefix);
+        while (pe > prefix && (pe[-1] == ' ' || pe[-1] == '\t')) *--pe = 0;
+        while (*model == ' ' || *model == '\t') model++;
+        char *me = model + strlen(model);
+        while (me > model && (me[-1] == ' ' || me[-1] == '\t')) *--me = 0;
+
+        int prefix_ok = (strlen(prefix) == 8);
+        for (const unsigned char *p = (const unsigned char*)prefix; *p; ++p)
+            if (!(*p >= '0' && *p <= '9')) prefix_ok = 0;
+
+        if (prefix_ok && *model) {
+            if (import_prefix(db, prefix, model) == 0) success++;
+            else skipped++;
+        } else {
+            skipped++;
         }
     }
 
     fclose(fp);
-    printf("匯入完成：%d / %d 條成功\n", success, total);
+    printf("匯入完成：%d / %d 條成功，%d 條跳過\n", success, total, skipped);
     return 0;
 }
 
@@ -193,7 +215,12 @@ char* generate_imei(sqlite3 *db, const char *model) {
 
     const unsigned char *prefix = sqlite3_column_text(stmt, 0);
     char imei14[15];
+    if (!prefix || sqlite3_column_bytes(stmt, 0) < 8) {
+        sqlite3_finalize(stmt);
+        return NULL;
+    }
     strncpy(imei14, (const char*)prefix, 8);  // 复制前缀
+    imei14[8] = 0;  // 确保截断
     for (int i = 8; i < 14; ++i) {  // 生成剩余部分
         imei14[i] = '0' + (rand() % 10);
     }
@@ -209,6 +236,8 @@ char* generate_imei(sqlite3 *db, const char *model) {
 
 int validate_imei(const char *imei) {
     if (strlen(imei) != 15) return 0;
+    for (int i = 0; i < 15; i++)
+        if (imei[i] < '0' || imei[i] > '9') return 0;
     char imei14[15];
     strncpy(imei14, imei, 14);
     imei14[14] = '\0';
@@ -220,7 +249,9 @@ int validate_imei(const char *imei) {
 int luhn_checksum(const char *imei14) {
     int sum = 0;
     for (int i = 0; i < 14; i++) {
-        int digit = imei14[i] - '0';
+        char c = imei14[i];
+        if (c < '0' || c > '9') return -1;   // 非数字
+        int digit = c - '0';
         if (i % 2 == 1) digit *= 2;
         if (digit > 9) digit -= 9;
         sum += digit;
