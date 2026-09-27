@@ -5,6 +5,52 @@
 #include <unistd.h>
 #include "sqlite3.h"
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <shellapi.h>
+
+/* Windows 中文系统 cmd 默认代码页是 GBK(936),而本程序全部文案与 CSV 均为
+ * UTF-8:启动时把控制台输入/输出代码页切到 65001(UTF-8),退出时恢复;
+ * 并把宽字符命令行转成 UTF-8,使中文路径/型号参数不乱码。
+ * 输出重定向到文件时无控制台,SetConsoleOutputCP 失败,字节流原样落盘(本就是 UTF-8),无害。
+ * POSIX 平台不受任何影响。 */
+static UINT g_old_out_cp = 0, g_old_in_cp = 0;
+
+static void restore_console_cp(void) {
+    /* atexit 在 stdio 刷新前运行:先把缓冲的 UTF-8 全部落屏,再恢复代码页 */
+    fflush(stdout);
+    fflush(stderr);
+    if (g_old_out_cp) SetConsoleOutputCP(g_old_out_cp);
+    if (g_old_in_cp)  SetConsoleCP(g_old_in_cp);
+}
+
+/* 把宽字符 argv 逐个转成 UTF-8;失败返回 NULL(调用方退回原始 argv,功能仍可用) */
+static char **win_utf8_argv(int argc, char **argv) {
+    (void)argv;
+    int wargc = 0;
+    wchar_t **wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    if (!wargv || wargc != argc) {
+        LocalFree(wargv);
+        return NULL;
+    }
+    char **u8 = (char **)calloc((size_t)argc + 1, sizeof(char *));
+    if (!u8) { LocalFree(wargv); return NULL; }
+    for (int i = 0; i < argc; ++i) {
+        int n = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, NULL, 0, NULL, NULL);
+        if (n <= 0 || !(u8[i] = (char *)malloc((size_t)n)) ||
+            WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, u8[i], n, NULL, NULL) <= 0) {
+            for (int j = 0; j < argc; ++j) free(u8[j]);
+            free(u8);
+            LocalFree(wargv);
+            return NULL;
+        }
+    }
+    LocalFree(wargv);
+    return u8;
+}
+#endif
+
 #define IMEI_DB "imei.db"
 #define MAX_LINE 256
 
@@ -25,6 +71,15 @@ void print_usage() {
 }
 
 int main(int argc, char *argv[]) {
+#ifdef _WIN32
+    g_old_out_cp = GetConsoleOutputCP();
+    g_old_in_cp  = GetConsoleCP();
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+    atexit(restore_console_cp);
+    char **u8argv = win_utf8_argv(argc, argv);
+    if (u8argv) argv = u8argv;
+#endif
     sqlite3 *db;
     if (init_db(&db) != SQLITE_OK) {
         fprintf(stderr, "无法初始化资料库\n");
@@ -171,7 +226,22 @@ int import_prefix(sqlite3 *db, const char *prefix, const char *model) {
 }
 
 int import_prefix_csv(sqlite3 *db, const char *filepath) {
-    FILE *fp = fopen(filepath, "r");
+    FILE *fp;
+#ifdef _WIN32
+    /* argv 已统一转成 UTF-8,而 ANSI 版 fopen 只认系统代码页(中文系统是 GBK);
+     * 中文路径须转宽字符走 _wfopen。 */
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, filepath, -1, NULL, 0);
+    wchar_t *wpath = (wlen > 0) ? (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t)) : NULL;
+    if (wpath) {
+        MultiByteToWideChar(CP_UTF8, 0, filepath, -1, wpath, wlen);
+        fp = _wfopen(wpath, L"r");
+        free(wpath);
+    } else {
+        fp = NULL;
+    }
+#else
+    fp = fopen(filepath, "r");
+#endif
     if (!fp) {
         perror("开启 CSV 失败");
         return 1;
