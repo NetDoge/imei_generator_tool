@@ -1,0 +1,155 @@
+name: release
+
+# 云编译并在 Releases 发布:
+#   1) 推 tag 触发:  git push origin v1.0.0
+#   2) 手动触发:     Actions 页面 -> release -> Run workflow,填版本号
+#
+# SQLite 以官方 amalgamation(sqlite3.c)合并编译进二进制,不依赖系统 libsqlite3:
+#   - Linux 产物静态链接,任何发行版直接跑
+#   - Windows 用 mingw-w64 交叉编译
+#   - macOS 用原生 runner(clang):Intel + Apple Silicon
+# SQLite 版本与 sha3 校验值固定在下方 SQL_VERSION/SQL_SHA3,升级时同步改这两行。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号(tag),如 v1.0.0'
+        required: true
+        default: 'v1.0.0'
+
+permissions:
+  contents: read
+
+env:
+  SQL_VERSION: 3530400
+  SQL_SHA3: 628a44cfe82c66aed1ccbbe85a562d2e33ebe64b3288981ed76285612227934e
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-amd64,   os: ubuntu-24.04, cc: gcc }
+          - { name: linux-arm64,   os: ubuntu-24.04, cc: aarch64-linux-gnu-gcc, apt: gcc-aarch64-linux-gnu }
+          - { name: linux-armv7l,  os: ubuntu-24.04, cc: arm-linux-gnueabihf-gcc, apt: gcc-arm-linux-gnueabihf }
+          - { name: linux-386,     os: ubuntu-24.04, cc: 'gcc -m32', apt: gcc-multilib }
+          - { name: windows-amd64, os: ubuntu-24.04, cc: x86_64-w64-mingw32-gcc, apt: gcc-mingw-w64-x86-64 }
+          - { name: windows-386,   os: ubuntu-24.04, cc: i686-w64-mingw32-gcc, apt: gcc-mingw-w64-i686 }
+          - { name: darwin-amd64,  os: macos-13,     cc: clang }
+          - { name: darwin-arm64,  os: macos-14,     cc: clang }
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 安装交叉编译器
+        if: matrix.apt != ''
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ${{ matrix.apt }}
+
+      - name: 下载 SQLite amalgamation(官方源,sha3 校验)
+        run: |
+          curl -fL --retry 5 --retry-delay 2 --retry-all-errors \
+            -o amal.zip "https://www.sqlite.org/2026/sqlite-amalgamation-${SQL_VERSION}.zip"
+          python3 - <<'PY'
+          import hashlib, os, sys
+          h = hashlib.sha3_256(open('amal.zip', 'rb').read()).hexdigest()
+          exp = os.environ['SQL_SHA3']
+          print('sha3-256:', h)
+          sys.exit(0 if h == exp else f'FAIL: expect {exp}')
+          PY
+          unzip -q amal.zip
+          ls sqlite-amalgamation-${SQL_VERSION}/
+
+      - name: 编译
+        run: |
+          AMD="sqlite-amalgamation-${SQL_VERSION}"
+          CC='${{ matrix.cc }}'
+          STATIC=''
+          LIBS=''
+          OUT=imei_tool
+          case '${{ matrix.name }}' in
+            linux-*)   STATIC='-static'; LIBS='-lm -ldl -lpthread' ;;
+            darwin-*)  LIBS='-lm' ;;
+            windows-*) OUT=imei_tool.exe ;;
+          esac
+          echo "building: $CC -> $OUT"
+          $CC -I"$AMD" -Wall -O2 $STATIC -o "$OUT" imei_tool.c "$AMD/sqlite3.c" $LIBS
+
+      - name: 校验产物
+        run: |
+          ls -lh
+          case '${{ matrix.name }}' in
+            linux-amd64)
+              readelf -h imei_tool | grep -q 'Machine:.*X86-64' || { echo 'FAIL: not X86-64'; exit 1; } ;;
+            linux-arm64)
+              readelf -h imei_tool | grep -q 'Machine:.*AArch64' || { echo 'FAIL: not AArch64'; exit 1; } ;;
+            linux-armv7l)
+              readelf -h imei_tool | grep -q 'Machine:.*ARM'    || { echo 'FAIL: not ARM'; exit 1; }
+              readelf -h imei_tool | grep -q 'Class:.*ELF32'    || { echo 'FAIL: not ELF32'; exit 1; } ;;
+            linux-386)
+              readelf -h imei_tool | grep -q 'Machine:.*Intel 80386' || { echo 'FAIL: not i386'; exit 1; }
+              readelf -h imei_tool | grep -q 'Class:.*ELF32'         || { echo 'FAIL: not ELF32'; exit 1; } ;;
+            windows-amd64)
+              file -b imei_tool.exe | grep -q 'x86-64' || { echo 'FAIL: not x86-64'; exit 1; } ;;
+            windows-386)
+              file -b imei_tool.exe | grep -q 'Intel 80386' || { echo 'FAIL: not i386'; exit 1; } ;;
+            darwin-amd64)
+              file -b imei_tool | grep -q 'x86_64' || { echo 'FAIL: not x86_64'; exit 1; } ;;
+            darwin-arm64)
+              file -b imei_tool | grep -q 'arm64'  || { echo 'FAIL: not arm64'; exit 1; } ;;
+          esac
+
+      - name: 冒烟(仅 linux-amd64)
+        if: matrix.name == 'linux-amd64'
+        run: |
+          ./imei_tool import imei_prefix.csv
+          ./imei_tool generate 5
+          V=$(./imei_tool generate 1)
+          ./imei_tool validate "$V"
+          echo 'SMOKE PASS'
+
+      - name: 打包
+        run: |
+          mkdir -p out
+          if [ -f imei_tool.exe ]; then
+            zip -q "out/imei-tool-${{ matrix.name }}.zip" imei_tool.exe README.md LICENSE imei_prefix.csv
+          else
+            tar -czf "out/imei-tool-${{ matrix.name }}.tar.gz" imei_tool README.md LICENSE imei_prefix.csv
+          fi
+          ls -lh out
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.name }}
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 生成 SHA256SUMS
+        run: |
+          cd dist
+          ls -lh
+          sha256sum imei-tool-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.event.inputs.version || github.ref_name }}
+          name: ${{ github.event.inputs.version || github.ref_name }}
+          files: dist/*
+          generate_release_notes: true
+          draft: false

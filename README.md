@@ -14,7 +14,28 @@
 
 ## 安装与编译
 
-### 安装依赖
+### 下载预编译版本(推荐)
+
+从 [Releases](https://github.com/NetDoge/imei_generator_tool/releases) 下载对应平台的压缩包,内含二进制、README、LICENSE 和示例 CSV:
+
+| 平台 | 文件 |
+|---|---|
+| Linux x86-64 | `imei-tool-linux-amd64.tar.gz` |
+| Linux ARM64 | `imei-tool-linux-arm64.tar.gz` |
+| Linux armv7 | `imei-tool-linux-armv7l.tar.gz` |
+| Linux 32 位 x86 | `imei-tool-linux-386.tar.gz` |
+| Windows x86-64 | `imei-tool-windows-amd64.zip` |
+| Windows 32 位 | `imei-tool-windows-386.zip` |
+| macOS Intel | `imei-tool-darwin-amd64.tar.gz` |
+| macOS Apple Silicon | `imei-tool-darwin-arm64.tar.gz` |
+
+- Linux 版为静态编译,不依赖系统 libsqlite3,任何发行版解压即用
+- Windows 版为 mingw 交叉编译,命令行直接运行(交互菜单需在终端中使用)
+- 下载后可用附件 `SHA256SUMS.txt` 校验完整性
+
+发版流程:推送 `v*` tag 自动触发 GitHub Actions 云编译并发布 Releases。
+
+### 从源码编译:安装依赖
 
 在 Linux 系统上,需要安装以下依赖:
 
