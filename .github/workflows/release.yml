@@ -39,8 +39,8 @@ jobs:
           - { name: linux-386,     os: ubuntu-24.04, cc: 'gcc -m32', apt: gcc-multilib }
           - { name: windows-amd64, os: ubuntu-24.04, cc: x86_64-w64-mingw32-gcc, apt: gcc-mingw-w64-x86-64 }
           - { name: windows-386,   os: ubuntu-24.04, cc: i686-w64-mingw32-gcc, apt: gcc-mingw-w64-i686 }
-          - { name: darwin-amd64,  os: macos-13,     cc: clang }
-          - { name: darwin-arm64,  os: macos-14,     cc: clang }
+          - { name: darwin-amd64,  os: macos-15,     cc: 'clang -arch x86_64' }
+          - { name: darwin-arm64,  os: macos-15,     cc: clang }
     steps:
       - uses: actions/checkout@v7
 
