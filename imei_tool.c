@@ -18,16 +18,16 @@ void menu(sqlite3 *db);
 
 void print_usage() {
     printf("用法:\n");
-    printf("  ./imei_tool                  啟動互動模式\n");
-    printf("  ./imei_tool generate <數量> [型號]\n");
+    printf("  ./imei_tool                  启动互动模式\n");
+    printf("  ./imei_tool generate <数量> [型号]\n");
     printf("  ./imei_tool validate <imei>\n");
-    printf("  ./imei_tool import <csv檔>\n");
+    printf("  ./imei_tool import <csv档>\n");
 }
 
 int main(int argc, char *argv[]) {
     sqlite3 *db;
     if (init_db(&db) != SQLITE_OK) {
-        fprintf(stderr, "無法初始化資料庫\n");
+        fprintf(stderr, "无法初始化资料库\n");
         return 1;
     }
 
@@ -45,20 +45,20 @@ int main(int argc, char *argv[]) {
                 printf("%s\n", imei);
                 free(imei);
             } else {
-                fprintf(stderr, "產生失敗。\n");
+                fprintf(stderr, "产生失败。\n");
                 break;
             }
         }
     } else if (argc == 3 && strcmp(argv[1], "validate") == 0) {
         if (strlen(argv[2]) == 15 && validate_imei(argv[2]))
-            printf("IMEI 驗證通過。\n");
+            printf("IMEI 验证通过。\n");
         else
-            printf("IMEI 驗證失敗。\n");
+            printf("IMEI 验证失败。\n");
     } else if (argc == 3 && strcmp(argv[1], "import") == 0) {
         if (import_prefix_csv(db, argv[2]) == 0)
-            printf("匯入完成。\n");
+            printf("导入完成。\n");
         else
-            printf("匯入失敗。\n");
+            printf("导入失败。\n");
     } else {
         print_usage();
     }
@@ -73,25 +73,25 @@ void menu(sqlite3 *db) {
 
     while (1) {
         printf("\n=== IMEI 工具 ===\n");
-        printf("1. 匯入 IMEI 前綴與型號\n");
-        printf("2. 產生隨機 IMEI\n");
-        printf("3. 驗證 IMEI\n");
-        printf("4. 離開\n");
-        printf("請選擇: ");
+        printf("1. 导入 IMEI 前缀与型号\n");
+        printf("2. 产生随机 IMEI\n");
+        printf("3. 验证 IMEI\n");
+        printf("4. 离开\n");
+        printf("请选择: ");
         int rc = scanf("%d", &choice);
         if (rc != 1) {
             // 清空残留在输入, 无效选项回显
             int c;
             while ((c = getchar()) != '\n' && c != EOF) {}
-            printf("無效選項。\n");
+            printf("无效选项。\n");
             continue;
         }
 
         switch (choice) {
             case 1: {
-                printf("輸入 IMEI 前綴 (8 碼): ");
+                printf("输入 IMEI 前缀 (8 码): ");
                 if (scanf("%63s", input) != 1) { while(getchar()!='\n'&&getchar()!=EOF); break; }
-                printf("輸入設備型號: ");
+                printf("输入设备型号: ");
                 if (scanf(" %63[^\n]", model) != 1) { while(getchar()!='\n'&&getchar()!=EOF); break; }
                 // 去型号首尾空白
                 char *m2 = model;
@@ -103,47 +103,47 @@ void menu(sqlite3 *db) {
                 if (ok) for (char *p=input; *p; ++p) if(!(*p>='0'&&*p<='9')){ok=0;break;}
                 if (ok) {
                     if (import_prefix(db, input, m2) == 0)
-                        printf("匯入成功。\n");
+                        printf("导入成功。\n");
                     else
-                        printf("匯入失敗或已存在。\n");
+                        printf("导入失败或已存在。\n");
                 } else {
-                    printf("前綴需為 8 位數字。\n");
+                    printf("前缀需为 8 位数字。\n");
                 }
                 break;
             }
             case 2: {
-                printf("輸入設備型號 (可留空): ");
+                printf("输入设备型号 (可留空): ");
                 // scanf("%d") 后残留换行; 用循环清空 stdin, 避免 getchar 吃有效输入
                 int ch;
                 while ((ch = getchar()) != '\n' && ch != EOF) {}
                 fgets(model, sizeof(model), stdin);
-                model[strcspn(model, "\n")] = 0;  // 去除換行
+                model[strcspn(model, "\n")] = 0;  // 去除换行
                 char *imei = generate_imei(db, strlen(model) > 0 ? model : NULL);
                 if (imei) {
-                    printf("產生的 IMEI：%s\n", imei);
+                    printf("产生的 IMEI：%s\n", imei);
                     free(imei);
                 } else {
-                    printf("產生失敗，可能無前綴。\n");
+                    printf("产生失败，可能无前缀。\n");
                 }
                 break;
             }
             case 3:
-                printf("輸入 IMEI (15 碼): ");
+                printf("输入 IMEI (15 码): ");
                 if (scanf("%63s", input) != 1) { while(getchar()!='\n'&&getchar()!=EOF); break; }
                 if (strlen(input) == 15) {
                     if (validate_imei(input))
-                        printf("IMEI 驗證通過。\n");
+                        printf("IMEI 验证通过。\n");
                     else
-                        printf("IMEI 驗證失敗。\n");
+                        printf("IMEI 验证失败。\n");
                 } else {
-                    printf("IMEI 長度需為 15 碼。\n");
+                    printf("IMEI 长度需为 15 码。\n");
                 }
                 break;
             case 4:
-                printf("再見！\n");
+                printf("再见！\n");
                 return;
             default:
-                printf("無效選項。\n");
+                printf("无效选项。\n");
         }
     }
 }
@@ -173,7 +173,7 @@ int import_prefix(sqlite3 *db, const char *prefix, const char *model) {
 int import_prefix_csv(sqlite3 *db, const char *filepath) {
     FILE *fp = fopen(filepath, "r");
     if (!fp) {
-        perror("開啟 CSV 失敗");
+        perror("开启 CSV 失败");
         return 1;
     }
 
@@ -209,7 +209,7 @@ int import_prefix_csv(sqlite3 *db, const char *filepath) {
     }
 
     fclose(fp);
-    printf("匯入完成：%d / %d 條成功，%d 條跳過\n", success, total, skipped);
+    printf("导入完成：%d / %d 条成功，%d 条跳过\n", success, total, skipped);
     return 0;
 }
 
