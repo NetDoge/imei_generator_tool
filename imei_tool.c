@@ -5,7 +5,7 @@
 #include <unistd.h>
 #include "sqlite3.h"
 
-#define IMEI_TOOL_VERSION "v1.0.2"
+#define IMEI_TOOL_VERSION "v1.0.3"
 #define IMEI_DB "imei.db"
 #define MAX_LINE 256
 #define MAX_GENERATE 1000000
@@ -226,10 +226,13 @@ void menu(sqlite3 *db) {
                 } else if (!valid_utf8(m2)) {
                     printf("型号包含非法字符(非 UTF-8 编码)。\n");
                 } else {
-                    if (import_prefix(db, input, m2) == 0)
+                    int rc = import_prefix(db, input, m2);
+                    if (rc == 0)
                         printf("导入成功。\n");
+                    else if (rc == 1)
+                        printf("该前缀已存在,未重复写入。\n");
                     else
-                        printf("导入失败或已存在。\n");
+                        printf("导入失败:%s\n", sqlite3_errmsg(db));
                 }
                 break;
             }
@@ -284,18 +287,21 @@ int init_db(sqlite3 **db) {
     return sqlite3_exec(*db, sql, 0, 0, 0);
 }
 
+/* 返回:0 = 新入库;1 = 前缀已存在,未写入;2 = 数据库错误 */
 int import_prefix(sqlite3 *db, const char *prefix, const char *model) {
     const char *sql = "INSERT OR IGNORE INTO imei_prefix (prefix, model) VALUES (?, ?);";
     sqlite3_stmt *stmt;
     int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, 0);
-    if (rc != SQLITE_OK) return rc;
+    if (rc != SQLITE_OK) return 2;
 
     sqlite3_bind_text(stmt, 1, prefix, -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 2, model, -1, SQLITE_STATIC);
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) return 2;
 
-    return rc == SQLITE_DONE ? 0 : rc;
+    /* INSERT OR IGNORE 命中已存在前缀时语句成功但未改任何行 */
+    return sqlite3_changes(db) == 0 ? 1 : 0;
 }
 
 /* 校验字符串是否为合法 UTF-8(RFC 3629):拒绝 GBK 等其他编码、
@@ -364,7 +370,7 @@ int import_prefix_csv(sqlite3 *db, const char *filepath) {
     }
 
     char line[MAX_LINE];
-    int success = 0, total = 0, skipped = 0, db_errors = 0, cr_warned = 0;
+    int success = 0, existed = 0, total = 0, skipped = 0, db_errors = 0, cr_warned = 0;
     const char *first_err = NULL;
     while (fgets(line, sizeof(line), fp)) {
         size_t len = strlen(line);
@@ -421,9 +427,9 @@ int import_prefix_csv(sqlite3 *db, const char *filepath) {
 
         if (prefix_ok && *model && valid_utf8(model)) {
             int rc = import_prefix(db, prefix, model);
-            if (rc == 0) {
-                success++;
-            } else {
+            if (rc == 0)      success++;
+            else if (rc == 1) existed++;
+            else {
                 skipped++;
                 db_errors++;
                 if (!first_err) first_err = sqlite3_errmsg(db);
@@ -440,13 +446,27 @@ int import_prefix_csv(sqlite3 *db, const char *filepath) {
         return 1;
     }
     fclose(fp);
-    printf("导入完成:%d / %d 条成功,%d 条跳过\n", success, total, skipped);
+    printf("导入完成:新入库 %d / 已存在 %d / 无效跳过 %d(共 %d 行)\n",
+           success, existed, skipped, total);
     if (db_errors > 0)
         fprintf(stderr, "警告:%d 条因数据库错误未入库(首个错误:%s)\n", db_errors, first_err);
-    if (success == 0)
-        return 1;   /* 一条都没入库:格式/编码全不符或库不可写,脚本需要能感知 */
+    if (success == 0 && existed == 0)
+        return 1;   /* 新入库与已存在都为 0:全部无效或库不可写,脚本需要能感知 */
     return 0;
 }
+
+/* 真实 RBI 分配表(TAC 前 2 位 = Reporting Body Identifier,GSMA 分配)。
+ * 仅收录有真实国家归属的代码;00/02-09(测试码)、10(DECT)、30(Iridium)、
+ * 98(保留)、99(GHA 国际)不属于国家码,不参与随机合成。 */
+static const struct { char code[3]; const char *country; } REAL_RBIS[] = {
+    {"01", "美国/PTCRB"},        {"35", "英国/BABT"},
+    {"86", "中国/TAF"},          {"91", "印度/MSAI"},
+    {"33", "法国/DGPT"},         {"44", "英国/BABT"},
+    {"45", "丹麦/NTA"},          {"49", "德国/BZT"},
+    {"50", "德国/BZT ETS"},      {"51", "德国/Cetecom ICT"},
+    {"52", "德国/Cetecom"},      {"53", "德国/TUV"},
+    {"54", "德国/Phoenix Test Lab"},
+};
 
 char* generate_imei(sqlite3 *db, const char *model) {
     const char *sql = model ?
@@ -459,40 +479,46 @@ char* generate_imei(sqlite3 *db, const char *model) {
 
     if (model) sqlite3_bind_text(stmt, 1, model, -1, SQLITE_STATIC);
     rc = sqlite3_step(stmt);
-    if (rc != SQLITE_ROW) {
-        sqlite3_finalize(stmt);
-        return NULL;
-    }
 
-    const unsigned char *prefix = sqlite3_column_text(stmt, 0);
-    int plen = sqlite3_column_bytes(stmt, 0);
-    /* 最后防线:库里被手工改坏的前缀(非 8 位纯数字)直接拒绝,不产出垃圾 IMEI */
+    const unsigned char *prefix = (rc == SQLITE_ROW) ? sqlite3_column_text(stmt, 0) : NULL;
+    int plen = (rc == SQLITE_ROW) ? sqlite3_column_bytes(stmt, 0) : 0;
+    /* 最后防线:库里被手工改坏的前缀(非 8 位纯数字)不用,绝不产出垃圾 IMEI */
     int prefix_ok = (prefix != NULL && plen == 8);
     if (prefix_ok) {
         for (int i = 0; i < 8; ++i)
             if (prefix[i] < '0' || prefix[i] > '9') { prefix_ok = 0; break; }
     }
-    if (!prefix_ok) {
-        sqlite3_finalize(stmt);
-        return NULL;
-    }
+
     char imei14[15];
-    memcpy(imei14, prefix, 8);  // 复制前缀
-    imei14[8] = 0;  // 确保截断
-    for (int i = 8; i < 14; ++i) {  // 生成剩余部分
-        imei14[i] = '0' + (rand() % 10);
+    if (prefix_ok) {
+        memcpy(imei14, prefix, 8);  // 复制库中前缀
+        sqlite3_finalize(stmt);
+        for (int i = 8; i < 14; ++i)  // 生成剩余部分
+            imei14[i] = '0' + (rand() % 10);
+    } else {
+        sqlite3_finalize(stmt);
+        if (model != NULL)
+            return NULL;   /* 指定了型号但未找到(或该型号前缀损坏):明确失败,不静默换随机前缀 */
+        /* 未指定前缀(空库/库中前缀全损坏):合成随机前缀。
+         * 前 2 位从真实 RBI 分配表抽取,保证国家码真实存在 */
+        static int hinted = 0;
+        if (!hinted) {
+            hinted = 1;
+            fprintf(stderr, "(库中无可用前缀,已随机合成真实国家码前缀)\n");
+        }
+        const char *rbi = REAL_RBIS[rand() % (int)(sizeof(REAL_RBIS) / sizeof(REAL_RBIS[0]))].code;
+        imei14[0] = rbi[0];
+        imei14[1] = rbi[1];
+        for (int i = 2; i < 14; ++i)
+            imei14[i] = '0' + (rand() % 10);
     }
     imei14[14] = '\0';  // 结束符
 
     int check_digit = luhn_checksum(imei14);  // 计算校验码
     char *imei15 = malloc(16);
-    if (!imei15) {
-        sqlite3_finalize(stmt);
-        return NULL;
-    }
+    if (!imei15) return NULL;
     snprintf(imei15, 16, "%s%d", imei14, check_digit);  // 生成完整 IMEI
 
-    sqlite3_finalize(stmt);
     return imei15;
 }
 

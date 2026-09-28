@@ -106,11 +106,18 @@ jobs:
       - name: 冒烟(仅 linux-amd64)
         if: matrix.name == 'linux-amd64'
         run: |
-          ./imei_tool version | grep -q 'v1.0.2'
+          ./imei_tool version | grep -q 'v1.0.3'
           ./imei_tool import imei_prefix.csv
           ./imei_tool generate 5
           V=$(./imei_tool generate 1)
           ./imei_tool validate "$V"
+          # 去重:重复导入必须全部计入"已存在",不重复写入
+          ./imei_tool import imei_prefix.csv | grep -q '新入库 0 / 已存在 3'
+          # 空库生成:真实国家码前缀(RBI)
+          rm -f imei.db
+          E=$(./imei_tool generate 1 2>/dev/null)
+          echo "$E" | grep -qE '^(01|33|35|44|45|49|50|51|52|53|54|86|91)'
+          ./imei_tool validate "$E"
           # 退出码语义(v1.0.2 起):0 成功 / 1 运行失败 / 2 用法错误
           if ./imei_tool validate 490154203237517; then echo 'FAIL: 非法 IMEI 应退出 1'; exit 1; fi
           if ./imei_tool generate 5x 2>/dev/null; then echo 'FAIL: 无效数量应退出 2'; exit 1; fi
