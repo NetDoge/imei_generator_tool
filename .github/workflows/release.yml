@@ -106,10 +106,17 @@ jobs:
       - name: 冒烟(仅 linux-amd64)
         if: matrix.name == 'linux-amd64'
         run: |
+          ./imei_tool version | grep -q 'v1.0.2'
           ./imei_tool import imei_prefix.csv
           ./imei_tool generate 5
           V=$(./imei_tool generate 1)
           ./imei_tool validate "$V"
+          # 退出码语义(v1.0.2 起):0 成功 / 1 运行失败 / 2 用法错误
+          if ./imei_tool validate 490154203237517; then echo 'FAIL: 非法 IMEI 应退出 1'; exit 1; fi
+          if ./imei_tool generate 5x 2>/dev/null; then echo 'FAIL: 无效数量应退出 2'; exit 1; fi
+          if ./imei_tool import /nonexistent.csv 2>/dev/null; then echo 'FAIL: 缺失文件应退出 1'; exit 1; fi
+          # EOF 必须干净退出(v1.0.1 及之前会无限刷屏)
+          timeout 5 ./imei_tool < /dev/null > /dev/null
           echo 'SMOKE PASS'
 
       - name: 打包

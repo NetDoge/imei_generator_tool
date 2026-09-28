@@ -2,3 +2,5 @@ imei_tool
 imei.db
 *.o
 imei_tool.exe
+imei_tool_strict
+imei_tool_asan

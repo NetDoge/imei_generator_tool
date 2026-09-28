@@ -5,6 +5,21 @@
 #include <unistd.h>
 #include "sqlite3.h"
 
+#define IMEI_TOOL_VERSION "v1.0.2"
+#define IMEI_DB "imei.db"
+#define MAX_LINE 256
+#define MAX_GENERATE 1000000
+
+#if defined(_WIN32)
+#define IMEI_PLATFORM "windows"
+#elif defined(__APPLE__)
+#define IMEI_PLATFORM "macOS"
+#elif defined(__linux__)
+#define IMEI_PLATFORM "linux"
+#else
+#define IMEI_PLATFORM "unknown"
+#endif
+
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -23,6 +38,17 @@ static void restore_console_cp(void) {
     fflush(stderr);
     if (g_old_out_cp) SetConsoleOutputCP(g_old_out_cp);
     if (g_old_in_cp)  SetConsoleCP(g_old_in_cp);
+}
+
+/* Ctrl+C / Ctrl+Break / 关闭窗口时,默认处理器直接终止进程、不经过 atexit,
+ * 控制台代码页会遗留为 65001。此处抢在默认处理器之前恢复代码页。
+ * 不调用 fflush:控制台处理器运行在独立线程,对 stdio 缓冲加锁有死锁风险,
+ * 丢弃尾部缓冲是可接受的折衷。 */
+static BOOL WINAPI ctrl_restore_cp(DWORD type) {
+    (void)type;
+    if (g_old_out_cp) SetConsoleOutputCP(g_old_out_cp);
+    if (g_old_in_cp)  SetConsoleCP(g_old_in_cp);
+    return FALSE; /* 交回默认处理器终止进程 */
 }
 
 /* 把宽字符 argv 逐个转成 UTF-8;失败返回 NULL(调用方退回原始 argv,功能仍可用) */
@@ -51,9 +77,6 @@ static char **win_utf8_argv(int argc, char **argv) {
 }
 #endif
 
-#define IMEI_DB "imei.db"
-#define MAX_LINE 256
-
 int init_db(sqlite3 **db);
 int import_prefix(sqlite3 *db, const char *prefix, const char *model);
 int import_prefix_csv(sqlite3 *db, const char *filepath);
@@ -61,13 +84,28 @@ char* generate_imei(sqlite3 *db, const char *model);
 int validate_imei(const char *imei);
 int luhn_checksum(const char *imei14);
 void menu(sqlite3 *db);
+static int valid_utf8(const char *s);
 
-void print_usage() {
-    printf("用法:\n");
-    printf("  ./imei_tool                  启动互动模式\n");
-    printf("  ./imei_tool generate <数量> [型号]\n");
-    printf("  ./imei_tool validate <imei>\n");
-    printf("  ./imei_tool import <csv档>\n");
+/* 丢弃 stdin 当前行剩余字符(含行尾换行);EOF 时立即返回 */
+static void drain_line(void) {
+    int c;
+    while ((c = getchar()) != '\n' && c != EOF) {}
+}
+
+/* 菜单内 stdin 结束(EOF)时的统一退出路径 */
+static void menu_eof_exit(void) {
+    printf("\n(输入已结束,离开)\n");
+}
+
+void print_usage(void) {
+    fprintf(stderr, "用法:\n");
+    fprintf(stderr, "  ./imei_tool                  启动互动模式\n");
+    fprintf(stderr, "  ./imei_tool generate <数量> [型号]\n");
+    fprintf(stderr, "  ./imei_tool validate <imei>\n");
+    fprintf(stderr, "  ./imei_tool import <csv档>\n");
+    fprintf(stderr, "  ./imei_tool version          显示版本\n");
+    fprintf(stderr, "\n退出码:0 成功;1 运行失败(验证不通过/导入失败/数据库错误);2 用法错误\n");
+    fprintf(stderr, "本工具仅供软件开发测试与学习研究,禁止用于伪造真实设备标识。\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -77,12 +115,19 @@ int main(int argc, char *argv[]) {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
     atexit(restore_console_cp);
+    SetConsoleCtrlHandler(ctrl_restore_cp, TRUE);
     char **u8argv = win_utf8_argv(argc, argv);
     if (u8argv) argv = u8argv;
 #endif
-    sqlite3 *db;
-    if (init_db(&db) != SQLITE_OK) {
-        fprintf(stderr, "无法初始化资料库\n");
+    if (argc == 2 && (strcmp(argv[1], "version") == 0 || strcmp(argv[1], "--version") == 0)) {
+        printf("imei_tool %s (%s)\n", IMEI_TOOL_VERSION, IMEI_PLATFORM);
+        return 0;
+    }
+
+    sqlite3 *db = NULL;
+    if (init_db(&db) != SQLITE_OK || !db) {
+        fprintf(stderr, "无法初始化资料库:%s\n", db ? sqlite3_errmsg(db) : "sqlite3_open 失败");
+        if (db) sqlite3_close(db);
         return 1;
     }
 
@@ -92,30 +137,44 @@ int main(int argc, char *argv[]) {
     if (argc == 1) {
         menu(db);
     } else if ((argc == 3 || argc == 4) && strcmp(argv[1], "generate") == 0) {
-        int count = atoi(argv[2]);
+        char *end = NULL;
+        long count = strtol(argv[2], &end, 10);
+        if (end == argv[2] || *end != '\0' || count < 0 || count > MAX_GENERATE) {
+            fprintf(stderr, "数量无效:%s(须为 0-%d 的整数)\n", argv[2], MAX_GENERATE);
+            sqlite3_close(db);
+            return 2;
+        }
         const char *model = argc == 4 ? argv[3] : NULL;
-        for (int i = 0; i < count; ++i) {
+        for (long i = 0; i < count; ++i) {
             char *imei = generate_imei(db, model);
             if (imei) {
                 printf("%s\n", imei);
                 free(imei);
             } else {
                 fprintf(stderr, "产生失败。\n");
-                break;
+                sqlite3_close(db);
+                return 1;
             }
         }
     } else if (argc == 3 && strcmp(argv[1], "validate") == 0) {
-        if (strlen(argv[2]) == 15 && validate_imei(argv[2]))
+        if (strlen(argv[2]) == 15 && validate_imei(argv[2])) {
             printf("IMEI 验证通过。\n");
-        else
+        } else {
             printf("IMEI 验证失败。\n");
+            sqlite3_close(db);
+            return 1;
+        }
     } else if (argc == 3 && strcmp(argv[1], "import") == 0) {
         if (import_prefix_csv(db, argv[2]) == 0)
             printf("导入完成。\n");
-        else
-            printf("导入失败。\n");
+        else {
+            sqlite3_close(db);
+            return 1;
+        }
     } else {
         print_usage();
+        sqlite3_close(db);
+        return 2;
     }
 
     sqlite3_close(db);
@@ -134,10 +193,10 @@ void menu(sqlite3 *db) {
         printf("4. 离开\n");
         printf("请选择: ");
         int rc = scanf("%d", &choice);
+        if (rc == EOF) { menu_eof_exit(); return; }
         if (rc != 1) {
             // 清空残留在输入, 无效选项回显
-            int c;
-            while ((c = getchar()) != '\n' && c != EOF) {}
+            drain_line();
             printf("无效选项。\n");
             continue;
         }
@@ -145,9 +204,15 @@ void menu(sqlite3 *db) {
         switch (choice) {
             case 1: {
                 printf("输入 IMEI 前缀 (8 码): ");
-                if (scanf("%63s", input) != 1) { while(getchar()!='\n'&&getchar()!=EOF); break; }
+                if (scanf("%63s", input) != 1) {
+                    if (feof(stdin)) { menu_eof_exit(); return; }
+                    drain_line(); break;
+                }
                 printf("输入设备型号: ");
-                if (scanf(" %63[^\n]", model) != 1) { while(getchar()!='\n'&&getchar()!=EOF); break; }
+                if (scanf(" %63[^\n]", model) != 1) {
+                    if (feof(stdin)) { menu_eof_exit(); return; }
+                    drain_line(); break;
+                }
                 // 去型号首尾空白
                 char *m2 = model;
                 while (*m2==' '||*m2=='\t') m2++;
@@ -156,13 +221,15 @@ void menu(sqlite3 *db) {
                 // 前缀必须 8 位纯数字
                 int ok = (strlen(input)==8);
                 if (ok) for (char *p=input; *p; ++p) if(!(*p>='0'&&*p<='9')){ok=0;break;}
-                if (ok) {
+                if (!ok) {
+                    printf("前缀需为 8 位数字。\n");
+                } else if (!valid_utf8(m2)) {
+                    printf("型号包含非法字符(非 UTF-8 编码)。\n");
+                } else {
                     if (import_prefix(db, input, m2) == 0)
                         printf("导入成功。\n");
                     else
                         printf("导入失败或已存在。\n");
-                } else {
-                    printf("前缀需为 8 位数字。\n");
                 }
                 break;
             }
@@ -171,7 +238,7 @@ void menu(sqlite3 *db) {
                 // scanf("%d") 后残留换行; 用循环清空 stdin, 避免 getchar 吃有效输入
                 int ch;
                 while ((ch = getchar()) != '\n' && ch != EOF) {}
-                fgets(model, sizeof(model), stdin);
+                if (!fgets(model, sizeof(model), stdin)) { menu_eof_exit(); return; }
                 model[strcspn(model, "\n")] = 0;  // 去除换行
                 char *imei = generate_imei(db, strlen(model) > 0 ? model : NULL);
                 if (imei) {
@@ -184,7 +251,10 @@ void menu(sqlite3 *db) {
             }
             case 3:
                 printf("输入 IMEI (15 码): ");
-                if (scanf("%63s", input) != 1) { while(getchar()!='\n'&&getchar()!=EOF); break; }
+                if (scanf("%63s", input) != 1) {
+                    if (feof(stdin)) { menu_eof_exit(); return; }
+                    drain_line(); break;
+                }
                 if (strlen(input) == 15) {
                     if (validate_imei(input))
                         printf("IMEI 验证通过。\n");
@@ -207,6 +277,9 @@ int init_db(sqlite3 **db) {
     int rc = sqlite3_open(IMEI_DB, db);
     if (rc != SQLITE_OK) return rc;
 
+    /* 并发场景(如另一实例正在导入)下等待锁释放,而非立即报错 */
+    sqlite3_busy_timeout(*db, 3000);
+
     const char *sql = "CREATE TABLE IF NOT EXISTS imei_prefix (id INTEGER PRIMARY KEY AUTOINCREMENT, prefix TEXT UNIQUE, model TEXT);";
     return sqlite3_exec(*db, sql, 0, 0, 0);
 }
@@ -223,6 +296,41 @@ int import_prefix(sqlite3 *db, const char *prefix, const char *model) {
     sqlite3_finalize(stmt);
 
     return rc == SQLITE_DONE ? 0 : rc;
+}
+
+/* 校验字符串是否为合法 UTF-8(RFC 3629):拒绝 GBK 等其他编码、
+ * 过长编码、代理区与超 U+10FFFF 序列,避免乱码静默入库 */
+static int valid_utf8(const char *s) {
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p) {
+        unsigned char c = *p;
+        if (c < 0x80) { p++; continue; }
+        int extra;
+        unsigned char lo = 0x80, hi = 0xBF;  /* 首个连续字节的合法窗口 */
+        if ((c & 0xE0) == 0xC0) {
+            extra = 1;
+            if (c < 0xC2) return 0;          /* 过长编码 C0/C1 */
+        } else if ((c & 0xF0) == 0xE0) {
+            extra = 2;
+            if (c == 0xE0) lo = 0xA0;        /* 排除过长 E0 80-9F */
+            else if (c == 0xED) hi = 0x9F;   /* 排除代理区 ED A0-BF */
+        } else if ((c & 0xF8) == 0xF0) {
+            extra = 3;
+            if (c > 0xF4) return 0;                 /* F5-FF:超 U+10FFFF,非法首字节 */
+            if (c == 0xF0) lo = 0x90;        /* 排除过长 F0 80-8F */
+            else if (c == 0xF4) hi = 0x8F;   /* 排除超 U+10FFFF */
+        } else {
+            return 0;                         /* 孤立连续字节或非法首字节(F5-FF) */
+        }
+        p++;
+        if (*p < lo || *p > hi) return 0;     /* 首个连续字节(含字符串提前结束) */
+        p++;
+        for (int i = 1; i < extra; ++i) {
+            if ((*p & 0xC0) != 0x80) return 0;
+            p++;
+        }
+    }
+    return 1;
 }
 
 int import_prefix_csv(sqlite3 *db, const char *filepath) {
@@ -247,11 +355,52 @@ int import_prefix_csv(sqlite3 *db, const char *filepath) {
         return 1;
     }
 
+    /* 整个导入包一个事务:逐行 autocommit 时每行一次 fsync,
+     * 万行级 CSV 会慢出两个数量级;出错整体回滚,不留半套数据 */
+    if (sqlite3_exec(db, "BEGIN", 0, 0, 0) != SQLITE_OK) {
+        fprintf(stderr, "无法开始事务:%s\n", sqlite3_errmsg(db));
+        fclose(fp);
+        return 1;
+    }
+
     char line[MAX_LINE];
-    int success = 0, total = 0, skipped = 0;
+    int success = 0, total = 0, skipped = 0, db_errors = 0, cr_warned = 0;
+    const char *first_err = NULL;
     while (fgets(line, sizeof(line), fp)) {
-        line[strcspn(line, "\r\n")] = 0;   // 去掉行尾 CR/LF
+        size_t len = strlen(line);
+        int toolong = 0;
+        if (len == sizeof(line) - 1 && line[len-1] != '\n') {
+            /* 行长超过缓冲:读掉本行剩余部分,整行跳过(不截断入库)。
+             * fgetc 返回 EOF 说明这是文件末尾无换行的完整行,正常处理。 */
+            int c = fgetc(fp);
+            if (c == EOF) {
+                /* 完整行 */
+            } else {
+                while (c != '\n' && c != EOF) c = fgetc(fp);
+                toolong = 1;
+            }
+        }
         total++;
+        if (toolong) { skipped++; continue; }
+
+        /* UTF-8 BOM(仅可能出现在首行):剥掉再解析 */
+        if (total == 1 && (unsigned char)line[0] == 0xEF &&
+            (unsigned char)line[1] == 0xBB && (unsigned char)line[2] == 0xBF) {
+            memmove(line, line + 3, strlen(line + 3) + 1);
+        }
+        /* 孤立 CR 后还跟内容:文件是 CR(旧 Mac)行尾,fgets 会把整文件读成一行,
+         * 静默丢掉首个记录之外的全部内容。此处整行跳过并警告,让用户转换行尾。 */
+        char *cr = strchr(line, '\r');
+        if (cr && cr[1] != '\n' && cr[1] != '\0') {
+            if (!cr_warned) {
+                fprintf(stderr, "警告:侦测到 CR(旧 Mac)行尾,仅支持 LF/CRLF;"
+                                "该行已整行跳过,请转换行尾后重新导入\n");
+                cr_warned = 1;
+            }
+            skipped++;
+            continue;
+        }
+        line[strcspn(line, "\r\n")] = 0;   // 去掉行尾 CR/LF
         // 找第一个有效分隔符; 型号只允许含简单字符(防注入逗号截断)
         char *delim = strpbrk(line, ",;");
         if (!delim) { skipped++; continue; }
@@ -270,16 +419,32 @@ int import_prefix_csv(sqlite3 *db, const char *filepath) {
         for (const unsigned char *p = (const unsigned char*)prefix; *p; ++p)
             if (!(*p >= '0' && *p <= '9')) prefix_ok = 0;
 
-        if (prefix_ok && *model) {
-            if (import_prefix(db, prefix, model) == 0) success++;
-            else skipped++;
+        if (prefix_ok && *model && valid_utf8(model)) {
+            int rc = import_prefix(db, prefix, model);
+            if (rc == 0) {
+                success++;
+            } else {
+                skipped++;
+                db_errors++;
+                if (!first_err) first_err = sqlite3_errmsg(db);
+            }
         } else {
             skipped++;
         }
     }
 
+    if (sqlite3_exec(db, "COMMIT", 0, 0, 0) != SQLITE_OK) {
+        fprintf(stderr, "提交失败:%s\n", sqlite3_errmsg(db));
+        sqlite3_exec(db, "ROLLBACK", 0, 0, 0);
+        fclose(fp);
+        return 1;
+    }
     fclose(fp);
-    printf("导入完成：%d / %d 条成功，%d 条跳过\n", success, total, skipped);
+    printf("导入完成:%d / %d 条成功,%d 条跳过\n", success, total, skipped);
+    if (db_errors > 0)
+        fprintf(stderr, "警告:%d 条因数据库错误未入库(首个错误:%s)\n", db_errors, first_err);
+    if (success == 0)
+        return 1;   /* 一条都没入库:格式/编码全不符或库不可写,脚本需要能感知 */
     return 0;
 }
 
@@ -300,12 +465,19 @@ char* generate_imei(sqlite3 *db, const char *model) {
     }
 
     const unsigned char *prefix = sqlite3_column_text(stmt, 0);
-    char imei14[15];
-    if (!prefix || sqlite3_column_bytes(stmt, 0) < 8) {
+    int plen = sqlite3_column_bytes(stmt, 0);
+    /* 最后防线:库里被手工改坏的前缀(非 8 位纯数字)直接拒绝,不产出垃圾 IMEI */
+    int prefix_ok = (prefix != NULL && plen == 8);
+    if (prefix_ok) {
+        for (int i = 0; i < 8; ++i)
+            if (prefix[i] < '0' || prefix[i] > '9') { prefix_ok = 0; break; }
+    }
+    if (!prefix_ok) {
         sqlite3_finalize(stmt);
         return NULL;
     }
-    strncpy(imei14, (const char*)prefix, 8);  // 复制前缀
+    char imei14[15];
+    memcpy(imei14, prefix, 8);  // 复制前缀
     imei14[8] = 0;  // 确保截断
     for (int i = 8; i < 14; ++i) {  // 生成剩余部分
         imei14[i] = '0' + (rand() % 10);
@@ -314,6 +486,10 @@ char* generate_imei(sqlite3 *db, const char *model) {
 
     int check_digit = luhn_checksum(imei14);  // 计算校验码
     char *imei15 = malloc(16);
+    if (!imei15) {
+        sqlite3_finalize(stmt);
+        return NULL;
+    }
     snprintf(imei15, 16, "%s%d", imei14, check_digit);  // 生成完整 IMEI
 
     sqlite3_finalize(stmt);
