@@ -106,7 +106,7 @@ jobs:
       - name: 冒烟(仅 linux-amd64)
         if: matrix.name == 'linux-amd64'
         run: |
-          ./imei_tool version | grep -q 'v1.0.5'
+          ./imei_tool version | grep -q 'v1.0.6'
           ./imei_tool import imei_prefix.csv
           ./imei_tool generate 5
           V=$(./imei_tool generate 1)
@@ -115,6 +115,23 @@ jobs:
           ./imei_tool import imei_prefix.csv | grep -q '新入库 0 / 已存在 3'
           # list 子命令:升序列出
           ./imei_tool list | head -1 | grep -q '^12345678 model A'
+          # v1.0.6:查询侧过滤——混合库只从有效前缀生成,指定型号不再间歇失败
+          rm -f imei.db
+          python3 -c "import sqlite3; con=sqlite3.connect('imei.db'); con.execute('CREATE TABLE imei_prefix(id INTEGER PRIMARY KEY AUTOINCREMENT, prefix TEXT UNIQUE, model TEXT)'); con.executemany('INSERT INTO imei_prefix(prefix,model) VALUES(?,?)', [('12345678','model A'),('abcdefgh','bad')]); con.commit()"
+          for i in $(seq 1 10); do ./imei_tool generate 1 | grep -q '^12345678'; done
+          ./imei_tool generate 5 "model A" | grep -c '^12345678' | grep -q '^5$'
+          # v1.0.6:空串型号等同于未指定
+          ./imei_tool generate 2 "" | grep -c '^12345678' | grep -q '^2$'
+          # v1.0.6:目录/空文件导入明确报错,退出码 1
+          if ./imei_tool import . 2>/dev/null; then echo 'FAIL: 目录导入应退出 1'; exit 1; fi
+          if ./imei_tool import /dev/null 2>/tmp/e; then echo 'FAIL: 空文件导入应退出 1'; exit 1; fi
+          grep -q 'CSV 文件为空' /tmp/e
+          # v1.0.6:菜单空型号不再吞行(退出菜单的 5 不会入库)
+          rm -f imei.db
+          printf '1\n1\n12345678\n\n\n5\n' | ./imei_tool | grep -q '型号不能为空'
+          python3 -c "import sqlite3; assert sqlite3.connect('imei.db').execute('SELECT COUNT(*) FROM imei_prefix').fetchone()[0] == 0"
+          # 恢复数据,供后续菜单冒烟使用
+          ./imei_tool import imei_prefix.csv >/dev/null
           # 菜单选项2:列出前缀
           printf '2\n5\n' | ./imei_tool | grep -qE '^12345678[[:space:]]+model A'
           # 菜单功能1:子菜单 CSV 批量导入(默认路径)

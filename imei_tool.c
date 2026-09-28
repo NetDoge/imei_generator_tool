@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -5,7 +6,7 @@
 #include <unistd.h>
 #include "sqlite3.h"
 
-#define IMEI_TOOL_VERSION "v1.0.5"
+#define IMEI_TOOL_VERSION "v1.0.6"
 #define IMEI_DB "imei.db"
 #define MAX_LINE 256
 #define MAX_GENERATE 1000000
@@ -85,6 +86,15 @@ int validate_imei(const char *imei);
 int luhn_checksum(const char *imei14);
 void menu(sqlite3 *db);
 static int valid_utf8(const char *s);
+static int model_has_ctrl(const char *s);
+
+/* 型号含控制字符(C0 控制码 0x01-0x1F 与 DEL 0x7F)则拒绝:
+ * 转义序列/换行等一旦入库,列名单回显与查询语义都会被搅乱 */
+static int model_has_ctrl(const char *s) {
+    for (const unsigned char *p = (const unsigned char *)s; *p; ++p)
+        if (*p < 0x20 || *p == 0x7F) return 1;
+    return 0;
+}
 
 /* 丢弃 stdin 当前行剩余字符(含行尾换行);EOF 时立即返回 */
 static void drain_line(void) {
@@ -145,7 +155,8 @@ int main(int argc, char *argv[]) {
             sqlite3_close(db);
             return 2;
         }
-        const char *model = argc == 4 ? argv[3] : NULL;
+        /* 空串型号与未指定同义(随机选前缀),与菜单留空行为对齐 */
+        const char *model = (argc == 4 && argv[3][0] != '\0') ? argv[3] : NULL;
         for (long i = 0; i < count; ++i) {
             char *imei = generate_imei(db, model);
             if (imei) {
@@ -179,9 +190,7 @@ int main(int argc, char *argv[]) {
         }
         sqlite3_finalize(stmt);
     } else if (argc == 3 && strcmp(argv[1], "import") == 0) {
-        if (import_prefix_csv(db, argv[2]) == 0)
-            printf("导入完成。\n");
-        else {
+        if (import_prefix_csv(db, argv[2]) != 0) {
             sqlite3_close(db);
             return 1;
         }
@@ -238,10 +247,35 @@ void menu(sqlite3 *db) {
                             drain_line(); break;
                         }
                         printf("输入设备型号: ");
-                        if (scanf(" %63[^\n]", model) != 1) {
+                        /* scanf(" %63[^\n]") 的前导空白会吞掉上一行的换行,
+                         * 把后续菜单输入当型号静默入库;改用 fgets 整行读入 */
+                        drain_line();   /* 清掉 %63s 残留的换行 */
+                        memset(model, 0xFF, sizeof(model));
+                        if (!fgets(model, sizeof(model), stdin)) {
                             if (feof(stdin)) { menu_eof_exit(); return; }
-                            drain_line(); break;
+                            break;
                         }
+                        {
+                            /* 哨兵:fgets 只写「实读内容+终止符」,
+                             * 尾部最后一个 NUL(mm)早于首个 NUL(mk)即内嵌 NUL */
+                            size_t mk = strlen(model);
+                            size_t mm = sizeof(model) - 1;
+                            while (mm > 0 && model[mm] != '\0') mm--;
+                            if (mm > mk) {
+                                printf("型号包含 NUL 字节,已拒绝。\n");
+                                break;
+                            }
+                        }
+                        if (!strchr(model, '\n')) {
+                            /* 无换行:恰 63 字符合法;更长则放弃本次导入 */
+                            int mc = getchar();
+                            if (mc != EOF && mc != '\n') {
+                                while (mc != '\n' && mc != EOF) mc = getchar();
+                                printf("型号过长(上限 63 个字符)。\n");
+                                break;
+                            }
+                        }
+                        model[strcspn(model, "\r\n")] = 0;
                         // 去型号首尾空白
                         char *m2 = model;
                         while (*m2==' '||*m2=='\t') m2++;
@@ -252,8 +286,12 @@ void menu(sqlite3 *db) {
                         if (ok) for (char *p=input; *p; ++p) if(!(*p>='0'&&*p<='9')){ok=0;break;}
                         if (!ok) {
                             printf("前缀需为 8 位数字。\n");
+                        } else if (*m2 == '\0') {
+                            printf("型号不能为空。\n");
                         } else if (!valid_utf8(m2)) {
                             printf("型号包含非法字符(非 UTF-8 编码)。\n");
+                        } else if (model_has_ctrl(m2)) {
+                            printf("型号包含控制字符,已拒绝。\n");
                         } else {
                             int rc = import_prefix(db, input, m2);
                             if (rc == 0)
@@ -272,16 +310,24 @@ void menu(sqlite3 *db) {
                         while ((ch = getchar()) != '\n' && ch != EOF) {}
                         char path[128];
                         if (!fgets(path, sizeof(path), stdin)) { menu_eof_exit(); return; }
+                        if (!strchr(path, '\n')) {
+                            /* 无换行:恰 127 字符合法;更长则明确报错,
+                             * 避免拿截断后的路径去开错文件 */
+                            int pc = getchar();
+                            if (pc != EOF && pc != '\n') {
+                                while (pc != '\n' && pc != EOF) pc = getchar();
+                                printf("路径过长(上限 127 个字符),已取消导入。\n");
+                                break;
+                            }
+                        }
                         path[strcspn(path, "\r\n")] = 0;
                         char *pp = path;
                         while (*pp == ' ' || *pp == '\t') pp++;
                         char *pe = pp + strlen(pp);
                         while (pe > pp && (pe[-1] == ' ' || pe[-1] == '\t')) *--pe = 0;
                         if (*pp == '\0') pp = (char*)"imei_prefix.csv";
-                        if (import_prefix_csv(db, pp) == 0)
-                            printf("导入完成。\n");
-                        else
-                            printf("导入失败。\n");
+                        /* 汇总行与错误原因均由 import_prefix_csv 输出 */
+                        import_prefix_csv(db, pp);
                         break;   /* 导入后回主菜单 */
                     }
 
@@ -291,8 +337,7 @@ void menu(sqlite3 *db) {
             }
 
             case 2: {
-                /* scanf("%d") 后残留换行:先清空,否则分页提示会被残留 '
-' 自动跳过 */
+                /* scanf("%d") 后残留换行:先清空,否则分页提示会被残留换行自动跳过 */
                 int ch;
                 while ((ch = getchar()) != '\n' && ch != EOF) {}
                 int total = 0;
@@ -465,24 +510,37 @@ int import_prefix_csv(sqlite3 *db, const char *filepath) {
     }
 
     char line[MAX_LINE];
-    int success = 0, existed = 0, total = 0, skipped = 0, db_errors = 0, cr_warned = 0;
+    int success = 0, existed = 0, total = 0, skipped = 0, db_errors = 0, cr_warned = 0, nul_warned = 0;
     const char *first_err = NULL;
-    while (fgets(line, sizeof(line), fp)) {
-        size_t len = strlen(line);
-        int toolong = 0;
-        if (len == sizeof(line) - 1 && line[len-1] != '\n') {
-            /* 行长超过缓冲:读掉本行剩余部分,整行跳过(不截断入库)。
-             * fgetc 返回 EOF 说明这是文件末尾无换行的完整行,正常处理。 */
-            int c = fgetc(fp);
-            if (c == EOF) {
-                /* 完整行 */
-            } else {
-                while (c != '\n' && c != EOF) c = fgetc(fp);
-                toolong = 1;
-            }
-        }
+    while (1) {
+        /* 哨兵:fgets 只写入「实读内容 + 恰一个 NUL 终止符」,先铺 0xFF,
+         * 自尾向头找到的最后一个 NUL 即终止符(m = 实读字节数);
+         * m 早于首个 NUL(k) 说明内容里内嵌了 NUL 字节 */
+        memset(line, 0xFF, sizeof(line));
+        if (!fgets(line, sizeof(line), fp)) break;
+        size_t k = strlen(line);
+        size_t m = sizeof(line) - 1;
+        while (m > 0 && line[m] != '\0') m--;
         total++;
-        if (toolong) { skipped++; continue; }
+        int toolong = 0, hasnul = 0;
+        if (m == sizeof(line) - 1 && line[m-1] != '\n') {
+            /* 实读 255 字节仍未见换行:内容已达 255 字节(不含换行),超限,
+             * 读掉残余部分后整行跳过(不截断入库) */
+            int c = fgetc(fp);
+            while (c != '\n' && c != EOF) c = fgetc(fp);
+            toolong = 1;
+        } else if (m > k) {
+            /* 行内嵌 NUL 字节:整行跳过,不动文件指针(换行已被 fgets 吃净) */
+            hasnul = 1;
+        }
+        if (toolong || hasnul) {
+            if (hasnul && !nul_warned) {
+                fprintf(stderr, "警告:侦测到 NUL 字节,相关行已整行跳过\n");
+                nul_warned = 1;
+            }
+            skipped++;
+            continue;
+        }
 
         /* UTF-8 BOM(仅可能出现在首行):剥掉再解析 */
         if (total == 1 && (unsigned char)line[0] == 0xEF &&
@@ -520,7 +578,7 @@ int import_prefix_csv(sqlite3 *db, const char *filepath) {
         for (const unsigned char *p = (const unsigned char*)prefix; *p; ++p)
             if (!(*p >= '0' && *p <= '9')) prefix_ok = 0;
 
-        if (prefix_ok && *model && valid_utf8(model)) {
+        if (prefix_ok && *model && valid_utf8(model) && !model_has_ctrl(model)) {
             int rc = import_prefix(db, prefix, model);
             if (rc == 0)      success++;
             else if (rc == 1) existed++;
@@ -534,20 +592,35 @@ int import_prefix_csv(sqlite3 *db, const char *filepath) {
         }
     }
 
-    if (sqlite3_exec(db, "COMMIT", 0, 0, 0) != SQLITE_OK) {
-        fprintf(stderr, "提交失败:%s\n", sqlite3_errmsg(db));
+    if (ferror(fp)) {
+        /* Linux 上 fopen 目录会成功、首次读取才报 EISDIR,须在提交前拦下 */
+        fprintf(stderr, "读取 CSV 出错:%s\n", strerror(errno));
         sqlite3_exec(db, "ROLLBACK", 0, 0, 0);
         fclose(fp);
         return 1;
     }
     fclose(fp);
-    printf("导入完成:新入库 %d / 已存在 %d / 无效跳过 %d(共 %d 行)\n",
+    if (total == 0) {
+        fprintf(stderr, "CSV 文件为空,未导入任何数据。\n");
+        sqlite3_exec(db, "ROLLBACK", 0, 0, 0);
+        return 1;
+    }
+    if (sqlite3_exec(db, "COMMIT", 0, 0, 0) != SQLITE_OK) {
+        fprintf(stderr, "提交失败:%s\n", sqlite3_errmsg(db));
+        sqlite3_exec(db, "ROLLBACK", 0, 0, 0);
+        return 1;
+    }
+    int all_failed = (success == 0 && existed == 0);
+    /* 新入库与已存在都为 0:全部行无效(表头/格式/编码不符)或库不可写,
+     * 脚本需要能感知,汇总行与退出码须与失败语义一致 */
+    printf("%s:新入库 %d / 已存在 %d / 无效跳过 %d(共 %d 行)\n",
+           all_failed ? "导入失败" : "导入完成",
            success, existed, skipped, total);
     if (db_errors > 0)
         fprintf(stderr, "警告:%d 条因数据库错误未入库(首个错误:%s)\n", db_errors, first_err);
-    if (success == 0 && existed == 0)
-        return 1;   /* 新入库与已存在都为 0:全部无效或库不可写,脚本需要能感知 */
-    return 0;
+    if (all_failed)
+        fprintf(stderr, "未导入任何数据(全部行无效或失败)。\n");
+    return all_failed ? 1 : 0;
 }
 
 /* 真实 RBI 分配表(TAC 前 2 位 = Reporting Body Identifier,GSMA 分配)。
@@ -564,9 +637,16 @@ static const struct { char code[3]; const char *country; } REAL_RBIS[] = {
 };
 
 char* generate_imei(sqlite3 *db, const char *model) {
+    /* 查询侧直接过滤:前缀须 8 位纯数字(NULL/空串/非数字一律不命中),
+     * 混合库中损坏行不再有机会被 ORDER BY RANDOM 抽中;
+     * 指定型号路径补 LIMIT 1,抽中即止 */
     const char *sql = model ?
-        "SELECT prefix FROM imei_prefix WHERE model = ? ORDER BY RANDOM();" :
-        "SELECT prefix FROM imei_prefix ORDER BY RANDOM() LIMIT 1;";
+        "SELECT prefix FROM imei_prefix WHERE model = ?"
+        " AND length(prefix) = 8 AND prefix NOT GLOB '*[^0-9]*'"
+        " ORDER BY RANDOM() LIMIT 1;" :
+        "SELECT prefix FROM imei_prefix"
+        " WHERE length(prefix) = 8 AND prefix NOT GLOB '*[^0-9]*'"
+        " ORDER BY RANDOM() LIMIT 1;";
 
     sqlite3_stmt *stmt;
     int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, 0);
@@ -577,7 +657,7 @@ char* generate_imei(sqlite3 *db, const char *model) {
 
     const unsigned char *prefix = (rc == SQLITE_ROW) ? sqlite3_column_text(stmt, 0) : NULL;
     int plen = (rc == SQLITE_ROW) ? sqlite3_column_bytes(stmt, 0) : 0;
-    /* 最后防线:库里被手工改坏的前缀(非 8 位纯数字)不用,绝不产出垃圾 IMEI */
+    /* 双保险:SQL 已过滤非 8 位纯数字前缀,读回仍校验一次,绝不产出垃圾 IMEI */
     int prefix_ok = (prefix != NULL && plen == 8);
     if (prefix_ok) {
         for (int i = 0; i < 8; ++i)

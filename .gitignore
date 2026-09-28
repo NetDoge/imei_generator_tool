@@ -4,3 +4,10 @@ imei.db
 imei_tool.exe
 imei_tool_strict
 imei_tool_asan
+imei_tool_v1005
+imei_tool_v1006.exe
+patch_v1006.py
+test_v1006.py
+imei.db-journal
+imei.db-wal
+imei.db-shm
