@@ -5,7 +5,7 @@
 #include <unistd.h>
 #include "sqlite3.h"
 
-#define IMEI_TOOL_VERSION "v1.0.4"
+#define IMEI_TOOL_VERSION "v1.0.5"
 #define IMEI_DB "imei.db"
 #define MAX_LINE 256
 #define MAX_GENERATE 1000000
@@ -103,6 +103,7 @@ void print_usage(void) {
     fprintf(stderr, "  ./imei_tool generate <数量> [型号]\n");
     fprintf(stderr, "  ./imei_tool validate <imei>\n");
     fprintf(stderr, "  ./imei_tool import <csv档>\n");
+    fprintf(stderr, "  ./imei_tool list            列出已导入的前缀\n");
     fprintf(stderr, "  ./imei_tool version          显示版本\n");
     fprintf(stderr, "\n退出码:0 成功;1 运行失败(验证不通过/导入失败/数据库错误);2 用法错误\n");
     fprintf(stderr, "本工具仅供软件开发测试与学习研究,禁止用于伪造真实设备标识。\n");
@@ -164,6 +165,19 @@ int main(int argc, char *argv[]) {
             sqlite3_close(db);
             return 1;
         }
+    } else if (argc == 2 && strcmp(argv[1], "list") == 0) {
+        sqlite3_stmt *stmt;
+        if (sqlite3_prepare_v2(db, "SELECT prefix, model FROM imei_prefix ORDER BY prefix", -1, &stmt, 0) != SQLITE_OK) {
+            fprintf(stderr, "查询失败:%s\n", sqlite3_errmsg(db));
+            sqlite3_close(db);
+            return 1;
+        }
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            const unsigned char *p = sqlite3_column_text(stmt, 0);
+            const unsigned char *m = sqlite3_column_text(stmt, 1);
+            printf("%s %s\n", p ? (const char *)p : "?", m ? (const char *)m : "");
+        }
+        sqlite3_finalize(stmt);
     } else if (argc == 3 && strcmp(argv[1], "import") == 0) {
         if (import_prefix_csv(db, argv[2]) == 0)
             printf("导入完成。\n");
@@ -188,9 +202,10 @@ void menu(sqlite3 *db) {
     while (1) {
         printf("\n=== IMEI 工具 ===\n");
         printf("1. 导入 IMEI 前缀与型号\n");
-        printf("2. 产生随机 IMEI\n");
-        printf("3. 验证 IMEI\n");
-        printf("4. 离开\n");
+        printf("2. 列出已导入的前缀\n");
+        printf("3. 产生随机 IMEI\n");
+        printf("4. 验证 IMEI\n");
+        printf("5. 离开\n");
         printf("请选择: ");
         int rc = scanf("%d", &choice);
         if (rc == EOF) { menu_eof_exit(); return; }
@@ -276,6 +291,47 @@ void menu(sqlite3 *db) {
             }
 
             case 2: {
+                /* scanf("%d") 后残留换行:先清空,否则分页提示会被残留 '
+' 自动跳过 */
+                int ch;
+                while ((ch = getchar()) != '\n' && ch != EOF) {}
+                int total = 0;
+                sqlite3_stmt *lstmt;
+                if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM imei_prefix", -1, &lstmt, 0) == SQLITE_OK) {
+                    if (sqlite3_step(lstmt) == SQLITE_ROW) total = sqlite3_column_int(lstmt, 0);
+                    sqlite3_finalize(lstmt);
+                }
+                if (total == 0) {
+                    printf("资料库为空,尚未导入任何前缀。\n");
+                    break;
+                }
+                printf("\n已导入 %d 条前缀:\n", total);
+                if (sqlite3_prepare_v2(db, "SELECT prefix, model FROM imei_prefix ORDER BY prefix", -1, &lstmt, 0) == SQLITE_OK) {
+                    int shown = 0;
+                    while (sqlite3_step(lstmt) == SQLITE_ROW) {
+                        const unsigned char *lp = sqlite3_column_text(lstmt, 0);
+                        const unsigned char *lm = sqlite3_column_text(lstmt, 1);
+                        printf("%-8s  %s\n", lp ? (const char *)lp : "?", lm ? (const char *)lm : "");
+                        shown++;
+                        if (shown % 20 == 0 && shown < total) {
+                            printf("-- 已显示 %d/%d 条,回车继续,q 返回 --", shown, total);
+                            fflush(stdout);
+                            int c = getchar();
+                            if (c == EOF) { printf("\n"); break; }
+                            int quit = (c == 'q' || c == 'Q');   /* 先记下再清行,drain 会覆盖 c */
+                            while (c != '\n' && c != EOF) c = getchar();
+                            printf("\n");   /* 结束提示行,后续数据另起一行 */
+                            if (quit) break;
+                        }
+                    }
+                    sqlite3_finalize(lstmt);
+                } else {
+                    printf("查询失败:%s\n", sqlite3_errmsg(db));
+                }
+                break;
+            }
+
+            case 3: {
                 printf("输入设备型号 (可留空): ");
                 // scanf("%d") 后残留换行; 用循环清空 stdin, 避免 getchar 吃有效输入
                 int ch;
@@ -291,7 +347,7 @@ void menu(sqlite3 *db) {
                 }
                 break;
             }
-            case 3:
+            case 4:
                 printf("输入 IMEI (15 码): ");
                 if (scanf("%63s", input) != 1) {
                     if (feof(stdin)) { menu_eof_exit(); return; }
@@ -306,7 +362,7 @@ void menu(sqlite3 *db) {
                     printf("IMEI 长度需为 15 码。\n");
                 }
                 break;
-            case 4:
+            case 5:
                 printf("再见！\n");
                 return;
             default:
