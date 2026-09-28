@@ -5,7 +5,7 @@
 #include <unistd.h>
 #include "sqlite3.h"
 
-#define IMEI_TOOL_VERSION "v1.0.3"
+#define IMEI_TOOL_VERSION "v1.0.4"
 #define IMEI_DB "imei.db"
 #define MAX_LINE 256
 #define MAX_GENERATE 1000000
@@ -203,39 +203,78 @@ void menu(sqlite3 *db) {
 
         switch (choice) {
             case 1: {
-                printf("输入 IMEI 前缀 (8 码): ");
-                if (scanf("%63s", input) != 1) {
-                    if (feof(stdin)) { menu_eof_exit(); return; }
-                    drain_line(); break;
-                }
-                printf("输入设备型号: ");
-                if (scanf(" %63[^\n]", model) != 1) {
-                    if (feof(stdin)) { menu_eof_exit(); return; }
-                    drain_line(); break;
-                }
-                // 去型号首尾空白
-                char *m2 = model;
-                while (*m2==' '||*m2=='\t') m2++;
-                char *me = m2 + strlen(m2);
-                while (me>m2 && (me[-1]==' '||me[-1]=='\t')) *--me=0;
-                // 前缀必须 8 位纯数字
-                int ok = (strlen(input)==8);
-                if (ok) for (char *p=input; *p; ++p) if(!(*p>='0'&&*p<='9')){ok=0;break;}
-                if (!ok) {
-                    printf("前缀需为 8 位数字。\n");
-                } else if (!valid_utf8(m2)) {
-                    printf("型号包含非法字符(非 UTF-8 编码)。\n");
-                } else {
-                    int rc = import_prefix(db, input, m2);
-                    if (rc == 0)
-                        printf("导入成功。\n");
-                    else if (rc == 1)
-                        printf("该前缀已存在,未重复写入。\n");
-                    else
-                        printf("导入失败:%s\n", sqlite3_errmsg(db));
+                while (1) {
+                    printf("\n--- 导入 IMEI 前缀与型号 ---\n");
+                    printf("1. 手动输入前缀与型号\n");
+                    printf("2. 从 CSV 文件批量导入\n");
+                    printf("0. 返回主菜单\n");
+                    printf("请选择: ");
+                    int sub;
+                    int rc2 = scanf("%d", &sub);
+                    if (rc2 == EOF) { menu_eof_exit(); return; }
+                    if (rc2 != 1) { drain_line(); printf("无效选项。\n"); continue; }
+
+                    if (sub == 0) break;   /* 返回主菜单 */
+
+                    if (sub == 1) {
+                        printf("输入 IMEI 前缀 (8 码): ");
+                        if (scanf("%63s", input) != 1) {
+                            if (feof(stdin)) { menu_eof_exit(); return; }
+                            drain_line(); break;
+                        }
+                        printf("输入设备型号: ");
+                        if (scanf(" %63[^\n]", model) != 1) {
+                            if (feof(stdin)) { menu_eof_exit(); return; }
+                            drain_line(); break;
+                        }
+                        // 去型号首尾空白
+                        char *m2 = model;
+                        while (*m2==' '||*m2=='\t') m2++;
+                        char *me = m2 + strlen(m2);
+                        while (me>m2 && (me[-1]==' '||me[-1]=='\t')) *--me=0;
+                        // 前缀必须 8 位纯数字
+                        int ok = (strlen(input)==8);
+                        if (ok) for (char *p=input; *p; ++p) if(!(*p>='0'&&*p<='9')){ok=0;break;}
+                        if (!ok) {
+                            printf("前缀需为 8 位数字。\n");
+                        } else if (!valid_utf8(m2)) {
+                            printf("型号包含非法字符(非 UTF-8 编码)。\n");
+                        } else {
+                            int rc = import_prefix(db, input, m2);
+                            if (rc == 0)
+                                printf("导入成功。\n");
+                            else if (rc == 1)
+                                printf("该前缀已存在,未重复写入。\n");
+                            else
+                                printf("导入失败:%s\n", sqlite3_errmsg(db));
+                        }
+                        break;   /* 导入后回主菜单 */
+                    }
+
+                    if (sub == 2) {
+                        printf("输入 CSV 文件路径(直接回车默认 imei_prefix.csv): ");
+                        int ch;
+                        while ((ch = getchar()) != '\n' && ch != EOF) {}
+                        char path[128];
+                        if (!fgets(path, sizeof(path), stdin)) { menu_eof_exit(); return; }
+                        path[strcspn(path, "\r\n")] = 0;
+                        char *pp = path;
+                        while (*pp == ' ' || *pp == '\t') pp++;
+                        char *pe = pp + strlen(pp);
+                        while (pe > pp && (pe[-1] == ' ' || pe[-1] == '\t')) *--pe = 0;
+                        if (*pp == '\0') pp = (char*)"imei_prefix.csv";
+                        if (import_prefix_csv(db, pp) == 0)
+                            printf("导入完成。\n");
+                        else
+                            printf("导入失败。\n");
+                        break;   /* 导入后回主菜单 */
+                    }
+
+                    printf("无效选项。\n");
                 }
                 break;
             }
+
             case 2: {
                 printf("输入设备型号 (可留空): ");
                 // scanf("%d") 后残留换行; 用循环清空 stdin, 避免 getchar 吃有效输入
